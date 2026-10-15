@@ -1,3 +1,5 @@
+Website link:-https://multilingual-local-language-app-system-hksetruxnzub37jgxyqj4t.streamlit.app/
+
 # 🌐 Multilingual Local Language Question Answering System
 
 An AI-powered question answering prototype for Indian local languages. The system accepts a question, detects the language, retrieves relevant information from a multilingual knowledge base using semantic search, and can generate a grounded answer using a local LLM through Ollama.
