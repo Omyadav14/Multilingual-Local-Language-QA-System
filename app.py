@@ -1,222 +1,258 @@
-import re
-import urllib.request
-import urllib.error
-import json
-from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import streamlit as st
-import faiss
-from sentence_transformers import SentenceTransformer
+from groq import Groq
 
-APP_DIR = Path(__file__).parent
-DATA_FILE = APP_DIR / "multilingual_qa_dataset.csv"
-
-LANGUAGE_NAMES = {
-    "hi": "Hindi",
-    "mr": "Marathi",
-    "bn": "Bengali",
-    "gu": "Gujarati",
-    "ta": "Tamil",
-    "te": "Telugu",
-}
-
-SCRIPT_RANGES = {
-    "hi": r"[\u0900-\u097F]",
-    "mr": r"[\u0900-\u097F]",
-    "bn": r"[\u0980-\u09FF]",
-    "gu": r"[\u0A80-\u0AFF]",
-    "ta": r"[\u0B80-\u0BFF]",
-    "te": r"[\u0C00-\u0C7F]",
-}
-
-# Common Devanagari words help distinguish Hindi and Marathi in this prototype.
-MARATHI_HINTS = {"आहे", "काय", "कोणती", "म्हणजे", "ही", "चा", "ची", "चे"}
-HINDI_HINTS = {"है", "क्या", "कौन", "कौनसा", "कौन सा", "का", "की", "के"}
-
-@st.cache_data
-def load_data():
-    if not DATA_FILE.exists():
-        st.error("Dataset file not found: multilingual_qa_dataset.csv")
-        st.stop()
-    return pd.read_csv(DATA_FILE)
-
-@st.cache_resource
-def load_model():
-    # Multilingual MiniLM is lightweight enough for a college prototype.
-    return SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-
-def detect_language(text):
-    text = text.strip()
-    for code in ["bn", "gu", "ta", "te"]:
-        if re.search(SCRIPT_RANGES[code], text):
-            return code
-
-    if re.search(SCRIPT_RANGES["hi"], text):
-        words = set(re.findall(r"[\u0900-\u097F]+", text))
-        if words & MARATHI_HINTS:
-            return "mr"
-        if words & HINDI_HINTS:
-            return "hi"
-        # Devanagari-only input is ambiguous; default to Hindi for this prototype.
-        return "hi"
-
-    return None
-
-def clean_text(text):
-    return re.sub(r"\s+", " ", text.strip())
-
-def build_index(model, df):
-    embeddings = model.encode(
-        df["question"].tolist(),
-        normalize_embeddings=True,
-        show_progress_bar=False
-    )
-    vectors = np.asarray(embeddings, dtype="float32")
-    index = faiss.IndexFlatIP(vectors.shape[1])
-    index.add(vectors)
-    return index
-
-def retrieve(question, model, index, df, language=None, top_k=3):
-    query_vector = model.encode([question], normalize_embeddings=True)
-    query_vector = np.asarray(query_vector, dtype="float32")
-
-    # Retrieve a wider set first, then prefer the detected language.
-    scores, ids = index.search(query_vector, min(top_k * 4, len(df)))
-    results = []
-    for score, idx in zip(scores[0], ids[0]):
-        if idx < 0:
-            continue
-        row = df.iloc[int(idx)].to_dict()
-        row["score"] = float(score)
-        results.append(row)
-
-    if language:
-        preferred = [r for r in results if r["language"] == LANGUAGE_NAMES[language]]
-        others = [r for r in results if r["language"] != LANGUAGE_NAMES[language]]
-        results = preferred + others
-
-    return results[:top_k]
-
-def ask_ollama(question, language_name, contexts, model_name="qwen2.5:3b"):
-    context_text = "\n\n".join(
-        f"Source: {item['source']}\nInformation: {item['answer']}"
-        for item in contexts
-    )
-
-    prompt = f"""You are a multilingual question answering assistant.
-Answer the user's question in {language_name}.
-Use only the supplied context. If the context does not contain enough information,
-say that the information is not available in the knowledge base.
-Keep the answer concise.
-
-Question: {question}
-
-Context:
-{context_text}
-"""
-
-    payload = json.dumps({
-        "model": model_name,
-        "prompt": prompt,
-        "stream": False
-    }).encode("utf-8")
-
-    request = urllib.request.Request(
-        "http://localhost:11434/api/generate",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            return data.get("response", "").strip(), None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        return None, str(exc)
-
+# ---------- Page Configuration ----------
 st.set_page_config(
-    page_title="Multilingual Local Language QA",
+    page_title="BhashaAI | Local Language Q&A",
     page_icon="🌐",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("🌐 Multilingual Local Language Question Answering System")
-st.caption("NLP + Multilingual Embeddings + FAISS + RAG + Open-Source LLM")
+# ---------- Custom Styling ----------
+st.markdown("""
+<style>
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        max-width: 1100px;
+    }
 
-with st.sidebar:
-    st.header("⚙️ Settings")
-    use_ollama = st.checkbox("Use local Qwen2.5-3B-Instruct via Ollama", value=False)
-    top_k = st.slider("Number of retrieved results", 1, 5, 3)
-    st.info("Supported: Hindi, Marathi, Bengali, Gujarati, Tamil and Telugu.")
+    .hero {
+        padding: 28px;
+        border-radius: 18px;
+        background: linear-gradient(120deg, #183B56, #2979A8);
+        color: white;
+        margin-bottom: 24px;
+    }
 
-df = load_data()
-model = load_model()
-index = build_index(model, df)
+    .hero h1 {
+        color: white;
+        margin-bottom: 8px;
+    }
 
+    .hero p {
+        color: #EAF5FC;
+        font-size: 16px;
+    }
+
+    .section-title {
+        font-size: 21px;
+        font-weight: 650;
+        margin-top: 12px;
+        margin-bottom: 8px;
+    }
+
+    div.stButton > button {
+        border-radius: 10px;
+        min-height: 44px;
+        font-weight: 600;
+    }
+
+    [data-testid="stSidebar"] {
+        border-right: 1px solid rgba(128, 128, 128, 0.25);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- Session History ----------
 if "history" not in st.session_state:
-    st.session_state.history = []
+    st.session_state["history"] = []
+
+# ---------- Language Options ----------
+languages = [
+    "English", "Hindi", "Marathi", "Gujarati",
+    "Bengali", "Tamil", "Telugu", "Kannada"
+]
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.title("🌐 BhashaAI")
+    st.caption("Local Language Question & Answer System")
+    st.divider()
+
+    st.subheader("Language Settings")
+
+    question_language = st.selectbox(
+        "Question language",
+        languages,
+        index=0
+    )
+
+    answer_language = st.selectbox(
+        "Answer language",
+        languages,
+        index=2
+    )
+
+    st.divider()
+
+    st.metric(
+        "Questions in this session",
+        len(st.session_state["history"])
+    )
+
+    st.caption(
+        "Choose a language for your question and a language "
+        "for the translated question and answer."
+    )
+
+# ---------- Main Header ----------
+st.markdown("""
+<div class="hero">
+    <h1>🌏 Ask in Your Language</h1>
+    <p>
+        Understand information across languages.
+        Enter a question, translate it, and receive an AI-generated answer.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# ---------- Question Input ----------
+st.markdown(
+    '<div class="section-title">✍️ Ask a Question</div>',
+    unsafe_allow_html=True
+)
 
 question = st.text_area(
-    "Ask your question",
-    placeholder="Example: भारताची राजधानी कोणती आहे?",
-    height=110
+    "Your question",
+    placeholder="Type your question here...",
+    height=130,
+    label_visibility="collapsed"
 )
 
-if st.button("🔎 Ask", type="primary"):
+generate = st.button(
+    "🌐 Translate Question & Get Answer",
+    type="primary",
+    use_container_width=True
+)
+
+# ---------- Answer Generation ----------
+if generate:
     if not question.strip():
-        st.warning("Please enter a question.")
-        st.stop()
+        st.warning("Please enter a question before continuing.")
 
-    cleaned = clean_text(question)
-    lang_code = detect_language(cleaned)
-
-    if lang_code is None:
-        st.error("Unsupported language. Please use Hindi, Marathi, Bengali, Gujarati, Tamil or Telugu.")
-        st.stop()
-
-    language_name = LANGUAGE_NAMES[lang_code]
-    results = retrieve(cleaned, model, index, df, lang_code, top_k)
-
-    st.success(f"Detected language: {language_name}")
-
-    answer = None
-    ollama_error = None
-
-    if use_ollama:
-        answer, ollama_error = ask_ollama(cleaned, language_name, results)
-
-    if answer:
-        final_answer = answer
     else:
-        # Safe prototype fallback: return the most relevant knowledge-base answer.
-        final_answer = results[0]["answer"]
-        if use_ollama and ollama_error:
-            st.caption("Ollama was unavailable, so the most relevant knowledge-base answer is shown.")
+        try:
+            client = Groq(
+                api_key=st.secrets["GROQ_API_KEY"]
+            )
 
-    st.subheader("💬 Answer")
-    st.write(final_answer)
+            with st.spinner(
+                "Translating your question and generating an answer..."
+            ):
+                response = client.chat.completions.create(
+                    model="openai/gpt-oss-120b",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"""
+You are a helpful multilingual question-answering assistant.
 
-    st.subheader("📚 Sources / Retrieved Context")
-    for i, item in enumerate(results, start=1):
-        with st.expander(f"{i}. {item['source']} — similarity {item['score']:.3f}"):
-            st.write(f"**Question:** {item['question']}")
-            st.write(f"**Information:** {item['answer']}")
+The original question is in {question_language}.
+Translate it accurately into {answer_language}, then answer it
+in {answer_language}.
 
-    st.session_state.history.append({
-        "question": cleaned,
-        "language": language_name,
-        "answer": final_answer
-    })
+Use exactly this format:
 
-if st.session_state.history:
+Translated Question:
+[Translated question]
+
+Answer:
+[Clear, helpful answer]
+
+Do not change the meaning of the original question.
+If you are unsure about an answer, say so in {answer_language}.
+"""
+                        },
+                        {
+                            "role": "user",
+                            "content": question
+                        }
+                    ],
+                    temperature=0.3
+                )
+
+            result = response.choices[0].message.content
+
+            # Store successful result in session history
+            st.session_state["history"].append({
+                "question": question,
+                "question_language": question_language,
+                "answer_language": answer_language,
+                "result": result
+            })
+
+            st.session_state["latest_result"] = result
+            st.session_state["latest_question"] = question
+
+        except Exception as error:
+            st.error("Unable to generate an answer.")
+            st.caption(f"Technical details: {error}")
+
+# ---------- Latest Result ----------
+if "latest_result" in st.session_state:
     st.divider()
-    st.subheader("📝 Conversation History")
-    for item in reversed(st.session_state.history[-10:]):
-        st.markdown(f"**{item['language']} — Q:** {item['question']}")
-        st.markdown(f"**A:** {item['answer']}")
-        st.divider()
+    st.subheader("✨ Generated Result")
 
-st.caption("Academic prototype • Local/open-source AI approach • Knowledge-base-grounded answering")
+    st.caption(
+        f"From {st.session_state['history'][-1]['question_language']} "
+        f"to {st.session_state['history'][-1]['answer_language']}"
+    )
+
+    st.markdown(st.session_state["latest_result"])
+
+    st.download_button(
+        label="⬇️ Download Answer",
+        data=st.session_state["latest_result"],
+        file_name="language_answer.txt",
+        mime="text/plain",
+        use_container_width=True
+    )
+
+# ---------- History ----------
+st.divider()
+st.subheader("📚 Question & Answer History")
+
+history = st.session_state["history"]
+
+if history:
+    top_left, top_right = st.columns([3, 1])
+
+    with top_left:
+        st.caption(
+            f"You have asked {len(history)} question(s) in this session."
+        )
+
+    with top_right:
+        if st.button("🗑️ Clear History", use_container_width=True):
+            st.session_state["history"] = []
+            st.session_state.pop("latest_result", None)
+            st.session_state.pop("latest_question", None)
+            st.rerun()
+
+    for number, item in enumerate(reversed(history), start=1):
+        with st.expander(f"Question {number}: {item['question'][:65]}"):
+            st.markdown("**Original question**")
+            st.write(item["question"])
+
+            st.caption(
+                f"Question: {item['question_language']} | "
+                f"Answer: {item['answer_language']}"
+            )
+
+            st.markdown("**Translated question and answer**")
+            st.markdown(item["result"])
+
+else:
+    st.info(
+        "Your history is empty. Ask your first question to see it here."
+    )
+
+# ---------- Footer ----------
+st.divider()
+st.caption(
+    "BhashaAI · B.Sc. Data Science Mini Project · "
+    "Powered by Streamlit and Groq"
+)
